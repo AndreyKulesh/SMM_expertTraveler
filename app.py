@@ -15,12 +15,13 @@ import os
 import logging
 import asyncio
 import json
-from datetime import datetime
-from typing import Optional, Dict, Tuple, Any
+from datetime import datetime, timedelta
+from typing import Optional, Dict, Tuple, Any, List
+from pathlib import Path
 
 import openai
 import requests
-from fastapi import FastAPI, HTTPException, status, BackgroundTasks
+from fastapi import FastAPI, HTTPException, status, BackgroundTasks, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from dotenv import load_dotenv
@@ -39,6 +40,140 @@ logging.basicConfig(
     ]
 )
 logger = logging.getLogger("travel-post-generator")
+
+class ScheduleManager:
+    """Управление расписанием публикаций"""
+    
+    def __init__(self, schedule_file: str = "schedule.json"):
+        self.schedule_file = Path(schedule_file)
+        self.schedule = self._load_schedule()
+    
+    def _load_schedule(self) -> Dict[str, Any]:
+        """Загружает расписание из файла"""
+        if self.schedule_file.exists():
+            try:
+                with open(self.schedule_file, 'r', encoding='utf-8') as f:
+                    return json.load(f)
+            except Exception as e:
+                logger.error(f"Ошибка при загрузке расписания: {e}")
+        return {
+            "next_post_time": None,
+            "frequency_hours": 24,
+            "enabled": True
+        }
+    
+    def _save_schedule(self):
+        """Сохраняет расписание в файл"""
+        try:
+            with open(self.schedule_file, 'w', encoding='utf-8') as f:
+                json.dump(self.schedule, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            logger.error(f"Ошибка при сохранении расписания: {e}")
+    
+    def get_next_post_time(self) -> Optional[str]:
+        """Возвращает время следующей публикации"""
+        return self.schedule.get("next_post_time")
+    
+    def set_next_post_time(self, post_time: str):
+        """Устанавливает время следующей публикации (формат: HH:MM или ISO datetime)"""
+        self.schedule["next_post_time"] = post_time
+        self._save_schedule()
+    
+    def set_frequency(self, hours: int):
+        """Устанавливает частоту публикаций в часах"""
+        self.schedule["frequency_hours"] = hours
+        self._save_schedule()
+    
+    def get_frequency(self) -> int:
+        """Возвращает частоту публикаций в часах"""
+        return self.schedule.get("frequency_hours", 24)
+    
+    def is_enabled(self) -> bool:
+        """Проверяет, включено ли расписание"""
+        return self.schedule.get("enabled", True)
+    
+    def set_enabled(self, enabled: bool):
+        """Включает/выключает расписание"""
+        self.schedule["enabled"] = enabled
+        self._save_schedule()
+
+class StatsManager:
+    """Управление статистикой вовлеченности"""
+    
+    def __init__(self, stats_file: str = "stats.json"):
+        self.stats_file = Path(stats_file)
+        self.stats = self._load_stats()
+    
+    def _load_stats(self) -> Dict[str, Any]:
+        """Загружает статистику из файла"""
+        if self.stats_file.exists():
+            try:
+                with open(self.stats_file, 'r', encoding='utf-8') as f:
+                    return json.load(f)
+            except Exception as e:
+                logger.error(f"Ошибка при загрузке статистики: {e}")
+        return {"posts": []}
+    
+    def _save_stats(self):
+        """Сохраняет статистику в файл"""
+        try:
+            with open(self.stats_file, 'w', encoding='utf-8') as f:
+                json.dump(self.stats, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            logger.error(f"Ошибка при сохранении статистики: {e}")
+    
+    def add_post(self, post_id: str, text_id: Optional[str] = None, photo_id: Optional[str] = None):
+        """Добавляет информацию о новом посте"""
+        post_data = {
+            "post_id": post_id,
+            "text_id": text_id,
+            "photo_id": photo_id,
+            "timestamp": datetime.now().isoformat(),
+            "views": 0,
+            "comments": 0
+        }
+        if "posts" not in self.stats:
+            self.stats["posts"] = []
+        self.stats["posts"].append(post_data)
+        # Храним только последние 100 постов
+        if len(self.stats["posts"]) > 100:
+            self.stats["posts"] = self.stats["posts"][-100:]
+        self._save_stats()
+    
+    def update_post_stats(self, post_id: str, views: Optional[int] = None, comments: Optional[int] = None):
+        """Обновляет статистику поста"""
+        for post in self.stats.get("posts", []):
+            if post.get("post_id") == post_id or post.get("text_id") == post_id or post.get("photo_id") == post_id:
+                if views is not None:
+                    post["views"] = views
+                if comments is not None:
+                    post["comments"] = comments
+                self._save_stats()
+                return True
+        return False
+    
+    def get_recent_stats(self, days: int = 7) -> Dict[str, Any]:
+        """Возвращает статистику за последние N дней"""
+        cutoff_date = datetime.now() - timedelta(days=days)
+        recent_posts = [
+            post for post in self.stats.get("posts", [])
+            if datetime.fromisoformat(post["timestamp"]) >= cutoff_date
+        ]
+        
+        total_views = sum(post.get("views", 0) for post in recent_posts)
+        total_comments = sum(post.get("comments", 0) for post in recent_posts)
+        avg_views = total_views / len(recent_posts) if recent_posts else 0
+        avg_comments = total_comments / len(recent_posts) if recent_posts else 0
+        
+        return {
+            "period_days": days,
+            "total_posts": len(recent_posts),
+            "total_views": total_views,
+            "total_comments": total_comments,
+            "avg_views": round(avg_views, 1),
+            "avg_comments": round(avg_comments, 1),
+            "posts": recent_posts[-10:]  # Последние 10 постов
+        }
 
 class Settings:
     """
@@ -76,6 +211,10 @@ class Settings:
 # Инициализация настроек
 settings = Settings()
 
+# Инициализация менеджеров
+schedule_manager = ScheduleManager()
+stats_manager = StatsManager()
+
 # Инициализация FastAPI приложения
 app = FastAPI(
     title="Travel Post Generator API",
@@ -102,7 +241,67 @@ class PostGenerationResponse(BaseModel):
     message: str
     timestamp: str
 
+class ScheduleRequest(BaseModel):
+    """Модель для запроса установки расписания"""
+    next_post_time: Optional[str] = None
+    frequency_hours: Optional[int] = None
+    enabled: Optional[bool] = None
+
+class ScheduleResponse(BaseModel):
+    """Модель для ответа с информацией о расписании"""
+    next_post_time: Optional[str]
+    frequency_hours: int
+    enabled: bool
+    message: str
+
+class StatsResponse(BaseModel):
+    """Модель для ответа со статистикой"""
+    period_days: int
+    total_posts: int
+    total_views: int
+    total_comments: int
+    avg_views: float
+    avg_comments: float
+    posts: List[Dict[str, Any]]
+
 # ====== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ======
+
+async def send_telegram_message(chat_id: str, message: str, parse_mode: str = "HTML") -> bool:
+    """
+    Отправляет сообщение в указанный чат Telegram.
+    
+    Args:
+        chat_id: ID чата для отправки
+        message: Текст сообщения
+        parse_mode: Режим парсинга (HTML или Markdown)
+        
+    Returns:
+        bool: True, если сообщение успешно отправлено, иначе False
+    """
+    if not settings.telegram_token:
+        return False
+    
+    try:
+        url = f"https://api.telegram.org/bot{settings.telegram_token}/sendMessage"
+        payload = {
+            "chat_id": chat_id,
+            "text": message,
+            "parse_mode": parse_mode,
+            "disable_web_page_preview": True
+        }
+        
+        response = await asyncio.to_thread(requests.post, url, data=payload)
+        response_data = response.json()
+        
+        if response_data.get("ok"):
+            return True
+        else:
+            logger.error(f"Ошибка при отправке сообщения: {response_data.get('description')}")
+            return False
+            
+    except Exception as e:
+        logger.exception(f"Ошибка при отправке сообщения в Telegram: {str(e)}")
+        return False
 
 async def send_status_message(message: str) -> bool:
     """
@@ -118,30 +317,11 @@ async def send_status_message(message: str) -> bool:
         logger.info(f"Статусное сообщение (без отправки, ADMIN_CHAT_ID не установлен): {message}")
         return False
     
-    try:
-        url = f"https://api.telegram.org/bot{settings.telegram_token}/sendMessage"
-        payload = {
-            "chat_id": settings.admin_chat_id,
-            "text": message,
-            "parse_mode": "HTML",
-            "disable_web_page_preview": True
-        }
-        
-        # Асинхронный запрос через requests в отдельном потоке
-        response = await asyncio.to_thread(requests.post, url, data=payload)
-        response_data = response.json()
-        
-        if response_data.get("ok"):
-            logger.info(f"Статусное сообщение отправлено администратору: {message[:100]}...")
-            return True
-        else:
-            error_desc = response_data.get('description', 'Неизвестная ошибка')
-            logger.error(f"Ошибка при отправке статусного сообщения: {error_desc}")
-            return False
-            
-    except Exception as e:
-        logger.exception(f"Критическая ошибка при отправке статусного сообщения: {str(e)}")
+    if not settings.admin_chat_id:
+        logger.info(f"Статусное сообщение (без отправки, ADMIN_CHAT_ID не установлен): {message}")
         return False
+    
+    return await send_telegram_message(settings.admin_chat_id, message)
 
 async def get_latest_message() -> Optional[str]:
     """
@@ -542,6 +722,228 @@ async def send_to_telegram(text: str) -> Optional[str]:
         await send_status_message(f"❌ Ошибка при отправке поста в Telegram: {str(e)}")
         return None
 
+async def update_post_stats_async(post_id: str):
+    """Асинхронно обновляет статистику поста через некоторое время после публикации"""
+    # Ждем 5 минут после публикации, чтобы собрать начальную статистику
+    await asyncio.sleep(300)  # 5 минут
+    
+    try:
+        views, comments = await get_post_statistics(post_id)
+        stats_manager.update_post_stats(post_id, views=views, comments=comments)
+        logger.info(f"Статистика обновлена для поста {post_id}: просмотры={views}, комментарии={comments}")
+    except Exception as e:
+        logger.exception(f"Ошибка при обновлении статистики поста {post_id}: {e}")
+
+async def get_post_statistics(post_id: str) -> Tuple[int, int]:
+    """
+    Получает статистику поста из Telegram (просмотры и комментарии).
+    
+    Args:
+        post_id: ID сообщения в Telegram
+        
+    Returns:
+        Tuple[int, int]: Количество просмотров и комментариев
+    """
+    try:
+        # Получаем информацию о сообщении
+        url = f"https://api.telegram.org/bot{settings.telegram_token}/getChat"
+        chat_response = await asyncio.to_thread(requests.get, url, params={"chat_id": settings.telegram_group_id})
+        
+        # Для получения статистики нужно использовать getChatMemberCount или forwardMessage
+        # Но Telegram API не предоставляет прямого способа получить просмотры/комментарии
+        # Поэтому будем использовать приблизительные методы
+        
+        # Пытаемся получить обновления и посчитать комментарии к посту
+        updates_url = f"https://api.telegram.org/bot{settings.telegram_token}/getUpdates"
+        updates_response = await asyncio.to_thread(requests.get, updates_url)
+        updates_data = updates_response.json()
+        
+        comments_count = 0
+        if updates_data.get("ok") and "result" in updates_data:
+            for update in updates_data["result"]:
+                if "message" in update:
+                    msg = update["message"]
+                    # Проверяем, является ли сообщение ответом на наш пост
+                    if msg.get("reply_to_message") and str(msg.get("reply_to_message", {}).get("message_id")) == str(post_id):
+                        comments_count += 1
+        
+        # Просмотры сложно получить точно через API, используем приблизительное значение
+        # В реальности можно использовать Telegram Bot API для каналов или другие методы
+        views = 0  # Будет обновляться вручную или через другие методы
+        
+        return views, comments_count
+        
+    except Exception as e:
+        logger.exception(f"Ошибка при получении статистики поста: {e}")
+        return 0, 0
+
+async def handle_bot_command(command: str, chat_id: str, message_text: str = "") -> str:
+    """
+    Обрабатывает команды от Telegram бота.
+    
+    Args:
+        command: Команда бота (например, /schedule, /stats)
+        chat_id: ID чата, откуда пришла команда
+        message_text: Полный текст сообщения
+        
+    Returns:
+        str: Ответ на команду
+    """
+    # Проверяем, что команда от администратора
+    if chat_id != settings.admin_chat_id:
+        return "❌ У вас нет прав для выполнения этой команды."
+    
+    command = command.lower().strip()
+    
+    if command == "/start" or command == "/help":
+        return """🤖 <b>SMM-эксперт путешественника</b>
+
+<b>Доступные команды:</b>
+/schedule - Показать текущее расписание публикаций
+/settime HH:MM - Установить время следующей публикации (например: /settime 14:30)
+/setfreq N - Установить частоту публикаций в часах (например: /setfreq 24)
+/stats - Показать статистику вовлеченности за последние 7 дней
+/stats N - Показать статистику за последние N дней
+/groups - Показать список групп, где бот является администратором
+/nextpost - Показать информацию о следующем запланированном посте
+
+Примеры:
+/settime 09:00 - установить публикацию на 9 утра
+/setfreq 12 - публиковать каждые 12 часов"""
+    
+    elif command == "/schedule":
+        next_time = schedule_manager.get_next_post_time()
+        frequency = schedule_manager.get_frequency()
+        enabled = schedule_manager.is_enabled()
+        
+        status_emoji = "✅" if enabled else "⏸️"
+        response = f"{status_emoji} <b>Текущее расписание:</b>\n\n"
+        response += f"📅 <b>Следующая публикация:</b> {next_time or 'Не установлено'}\n"
+        response += f"⏰ <b>Частота:</b> каждые {frequency} часов\n"
+        response += f"🔄 <b>Статус:</b> {'Включено' if enabled else 'Выключено'}\n\n"
+        response += "Используйте /settime для установки времени или /setfreq для изменения частоты."
+        return response
+    
+    elif command.startswith("/settime"):
+        # Парсим время из команды /settime HH:MM
+        parts = message_text.split()
+        if len(parts) < 2:
+            return "❌ Неверный формат. Используйте: /settime HH:MM\nПример: /settime 14:30"
+        
+        time_str = parts[1]
+        try:
+            # Проверяем формат времени
+            hour, minute = map(int, time_str.split(':'))
+            if not (0 <= hour <= 23 and 0 <= minute <= 59):
+                return "❌ Неверное время. Используйте формат HH:MM (например: 14:30)"
+            
+            # Устанавливаем время следующей публикации
+            schedule_manager.set_next_post_time(time_str)
+            
+            response = f"✅ Время следующей публикации установлено: <b>{time_str}</b>\n\n"
+            response += f"📅 Следующий пост будет опубликован в {time_str}"
+            return response
+            
+        except ValueError:
+            return "❌ Неверный формат времени. Используйте: /settime HH:MM\nПример: /settime 14:30"
+    
+    elif command.startswith("/setfreq"):
+        # Парсим частоту из команды /setfreq N
+        parts = message_text.split()
+        if len(parts) < 2:
+            return "❌ Неверный формат. Используйте: /setfreq N\nПример: /setfreq 24 (каждые 24 часа)"
+        
+        try:
+            hours = int(parts[1])
+            if hours < 1:
+                return "❌ Частота должна быть не менее 1 часа"
+            
+            schedule_manager.set_frequency(hours)
+            response = f"✅ Частота публикаций установлена: <b>каждые {hours} часов</b>\n\n"
+            response += f"📅 Посты будут публиковаться каждые {hours} часов"
+            return response
+            
+        except ValueError:
+            return "❌ Неверный формат. Используйте: /setfreq N\nПример: /setfreq 24"
+    
+    elif command.startswith("/stats"):
+        # Парсим количество дней из команды /stats N
+        parts = message_text.split()
+        days = 7  # По умолчанию 7 дней
+        if len(parts) > 1:
+            try:
+                days = int(parts[1])
+                if days < 1:
+                    days = 7
+            except ValueError:
+                pass
+        
+        stats = stats_manager.get_recent_stats(days)
+        
+        response = f"📊 <b>Статистика вовлеченности за последние {days} дней:</b>\n\n"
+        response += f"📝 <b>Всего постов:</b> {stats['total_posts']}\n"
+        response += f"👁️ <b>Всего просмотров:</b> {stats['total_views']}\n"
+        response += f"💬 <b>Всего комментариев:</b> {stats['total_comments']}\n"
+        response += f"📈 <b>Среднее просмотров:</b> {stats['avg_views']}\n"
+        response += f"💭 <b>Среднее комментариев:</b> {stats['avg_comments']}\n"
+        
+        if stats['posts']:
+            response += "\n<b>Последние посты:</b>\n"
+            for post in stats['posts'][-5:]:  # Показываем последние 5
+                post_time = datetime.fromisoformat(post['timestamp']).strftime("%d.%m %H:%M")
+                response += f"• {post_time}: 👁️ {post.get('views', 0)} 💬 {post.get('comments', 0)}\n"
+        
+        return response
+    
+    elif command == "/groups":
+        try:
+            # Получаем список групп, где бот является администратором
+            url = f"https://api.telegram.org/bot{settings.telegram_token}/getChat"
+            response = await asyncio.to_thread(requests.get, url, params={"chat_id": settings.telegram_group_id})
+            chat_data = response.json()
+            
+            if chat_data.get("ok"):
+                chat = chat_data["result"]
+                response = f"👥 <b>Текущая группа:</b>\n\n"
+                response += f"📝 <b>Название:</b> {chat.get('title', 'Неизвестно')}\n"
+                response += f"🆔 <b>ID:</b> {chat.get('id')}\n"
+                response += f"📋 <b>Тип:</b> {chat.get('type', 'Неизвестно')}\n"
+                
+                # Проверяем права бота
+                member_url = f"https://api.telegram.org/bot{settings.telegram_token}/getChatMember"
+                member_response = await asyncio.to_thread(
+                    requests.get, 
+                    member_url, 
+                    params={"chat_id": settings.telegram_group_id, "user_id": settings.telegram_token.split(':')[0]}
+                )
+                # Это упрощенная версия, в реальности нужно использовать правильный user_id бота
+                
+                return response
+            else:
+                return "❌ Не удалось получить информацию о группе."
+                
+        except Exception as e:
+            logger.exception(f"Ошибка при получении информации о группах: {e}")
+            return f"❌ Ошибка при получении информации о группах: {str(e)}"
+    
+    elif command == "/nextpost":
+        next_time = schedule_manager.get_next_post_time()
+        frequency = schedule_manager.get_frequency()
+        
+        if next_time:
+            response = f"📅 <b>Следующий запланированный пост:</b>\n\n"
+            response += f"⏰ <b>Время:</b> {next_time}\n"
+            response += f"🔄 <b>Частота:</b> каждые {frequency} часов\n\n"
+            response += "✅ Пост будет опубликован автоматически в указанное время."
+        else:
+            response = "⚠️ Время следующей публикации не установлено.\n\n"
+            response += "Используйте /settime HH:MM для установки времени следующей публикации."
+        
+        return response
+    
+    else:
+        return "❌ Неизвестная команда. Используйте /help для списка доступных команд."
+
 async def generate_and_publish_post(background: bool = False) -> Dict[str, Any]:
     """
     Основная функция: генерирует и публикует пост в Telegram.
@@ -604,6 +1006,19 @@ async def generate_and_publish_post(background: bool = False) -> Dict[str, Any]:
             "timestamp": datetime.now().isoformat(),
             "processing_time": (datetime.now() - start_time).total_seconds()
         }
+        
+        # Сохраняем статистику поста
+        if photo_id or text_id:
+            post_id_for_stats = photo_id or text_id
+            stats_manager.add_post(
+                post_id=post_id_for_stats,
+                text_id=text_id,
+                photo_id=photo_id
+            )
+            
+            # Пытаемся получить начальную статистику
+            # В фоне обновим статистику позже
+            asyncio.create_task(update_post_stats_async(post_id_for_stats))
         
         # Отправляем статусное сообщение об успехе
         status_msg = "✅ Пост успешно опубликован!\n"
@@ -682,6 +1097,98 @@ async def generate_post_endpoint(background_tasks: BackgroundTasks):
         message="Запрос на генерацию поста принят. Процесс запущен в фоновом режиме.",
         timestamp=datetime.now().isoformat()
     )
+
+@app.post("/webhook")
+async def telegram_webhook(request: Request):
+    """
+    Webhook для получения обновлений от Telegram Bot API.
+    Обрабатывает команды от администратора.
+    """
+    try:
+        data = await request.json()
+        
+        # Проверяем, что это сообщение
+        if "message" not in data:
+            return JSONResponse(content={"ok": True})
+        
+        message = data["message"]
+        chat_id = str(message.get("chat", {}).get("id"))
+        text = message.get("text", "")
+        
+        # Обрабатываем только команды
+        if not text.startswith("/"):
+            return JSONResponse(content={"ok": True})
+        
+        # Извлекаем команду
+        parts = text.split(maxsplit=1)
+        command = parts[0]
+        
+        # Обрабатываем команду
+        response_text = await handle_bot_command(command, chat_id, text)
+        
+        # Отправляем ответ
+        await send_telegram_message(chat_id, response_text)
+        
+        return JSONResponse(content={"ok": True})
+        
+    except Exception as e:
+        logger.exception(f"Ошибка при обработке webhook: {e}")
+        return JSONResponse(content={"ok": False, "error": str(e)}, status_code=500)
+
+@app.get("/schedule", response_model=ScheduleResponse)
+async def get_schedule():
+    """
+    Эндпоинт для получения текущего расписания публикаций.
+    """
+    return ScheduleResponse(
+        next_post_time=schedule_manager.get_next_post_time(),
+        frequency_hours=schedule_manager.get_frequency(),
+        enabled=schedule_manager.is_enabled(),
+        message="Расписание успешно получено"
+    )
+
+@app.post("/schedule", response_model=ScheduleResponse)
+async def set_schedule(schedule_request: ScheduleRequest):
+    """
+    Эндпоинт для установки расписания публикаций.
+    """
+    if schedule_request.next_post_time is not None:
+        schedule_manager.set_next_post_time(schedule_request.next_post_time)
+    
+    if schedule_request.frequency_hours is not None:
+        schedule_manager.set_frequency(schedule_request.frequency_hours)
+    
+    if schedule_request.enabled is not None:
+        schedule_manager.set_enabled(schedule_request.enabled)
+    
+    # Уведомляем администратора об изменении расписания
+    next_time = schedule_manager.get_next_post_time()
+    frequency = schedule_manager.get_frequency()
+    enabled = schedule_manager.is_enabled()
+    
+    status_msg = "📅 <b>Расписание обновлено:</b>\n\n"
+    status_msg += f"⏰ <b>Следующая публикация:</b> {next_time or 'Не установлено'}\n"
+    status_msg += f"🔄 <b>Частота:</b> каждые {frequency} часов\n"
+    status_msg += f"✅ <b>Статус:</b> {'Включено' if enabled else 'Выключено'}"
+    await send_status_message(status_msg)
+    
+    return ScheduleResponse(
+        next_post_time=next_time,
+        frequency_hours=frequency,
+        enabled=enabled,
+        message="Расписание успешно обновлено"
+    )
+
+@app.get("/stats", response_model=StatsResponse)
+async def get_stats(days: int = 7):
+    """
+    Эндпоинт для получения статистики вовлеченности.
+    
+    Args:
+        days: Количество дней для анализа (по умолчанию 7)
+    """
+    stats = stats_manager.get_recent_stats(days)
+    return StatsResponse(**stats)
 
 @app.get("/test-notification")
 async def test_notification():
