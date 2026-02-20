@@ -21,6 +21,7 @@ from pathlib import Path
 
 import openai
 import requests
+from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, status, BackgroundTasks, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
@@ -59,7 +60,8 @@ class ScheduleManager:
         return {
             "next_post_time": None,
             "frequency_hours": 24,
-            "enabled": True
+            "enabled": True,
+            "next_run_at": None  # ISO datetime следующего запуска
         }
     
     def _save_schedule(self):
@@ -75,8 +77,18 @@ class ScheduleManager:
         return self.schedule.get("next_post_time")
     
     def set_next_post_time(self, post_time: str):
-        """Устанавливает время следующей публикации (формат: HH:MM или ISO datetime)"""
+        """Устанавливает время следующей публикации (формат: HH:MM или ISO datetime). Обновляет next_run_at."""
         self.schedule["next_post_time"] = post_time
+        if post_time and ":" in str(post_time) and len(str(post_time)) <= 5:
+            try:
+                hour, minute = map(int, str(post_time).strip().split(":")[:2])
+                now = datetime.now()
+                candidate = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+                if candidate <= now:
+                    candidate += timedelta(days=1)
+                self.schedule["next_run_at"] = candidate.isoformat()
+            except (ValueError, TypeError):
+                pass
         self._save_schedule()
     
     def set_frequency(self, hours: int):
@@ -95,6 +107,40 @@ class ScheduleManager:
     def set_enabled(self, enabled: bool):
         """Включает/выключает расписание"""
         self.schedule["enabled"] = enabled
+        self._save_schedule()
+    
+    def get_next_run_at(self) -> Optional[datetime]:
+        """Возвращает datetime следующей запланированной публикации (для планировщика)."""
+        next_run = self.schedule.get("next_run_at")
+        if next_run:
+            try:
+                return datetime.fromisoformat(next_run)
+            except (ValueError, TypeError):
+                pass
+        # Вычисляем из next_post_time (HH:MM)
+        time_str = self.schedule.get("next_post_time")
+        if not time_str or ":" not in str(time_str):
+            return None
+        try:
+            hour, minute = map(int, str(time_str).strip().split(":")[:2])
+            now = datetime.now()
+            candidate = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+            if candidate <= now:
+                candidate += timedelta(days=1)
+            self.schedule["next_run_at"] = candidate.isoformat()
+            self._save_schedule()
+            return candidate
+        except (ValueError, TypeError):
+            return None
+    
+    def set_next_run_at(self, dt: datetime):
+        """Устанавливает время следующего запуска (после публикации по расписанию)."""
+        self.schedule["next_run_at"] = dt.isoformat()
+        self._save_schedule()
+    
+    def set_next_run_after_publish(self):
+        """Вызвать после публикации: следующий запуск = сейчас + frequency_hours."""
+        self.schedule["next_run_at"] = (datetime.now() + timedelta(hours=self.get_frequency())).isoformat()
         self._save_schedule()
 
 class StatsManager:
@@ -175,6 +221,71 @@ class StatsManager:
             "posts": recent_posts[-10:]  # Последние 10 постов
         }
 
+class GroupsManager:
+    """Управление списком групп, в которых бот является администратором."""
+    
+    def __init__(self, groups_file: str = "groups.json"):
+        self.groups_file = Path(groups_file)
+        self.groups: List[Dict[str, Any]] = self._load_groups()
+        self._active_group_id: Optional[str] = None
+    
+    def _load_groups(self) -> List[Dict[str, Any]]:
+        self._active_group_id = None
+        if self.groups_file.exists():
+            try:
+                with open(self.groups_file, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                    if isinstance(data, list):
+                        return data
+                    self._active_group_id = data.get("active_group_id") or None
+                    return data.get("groups", [])
+            except Exception as e:
+                logger.error(f"Ошибка при загрузке групп: {e}")
+        return []
+    
+    def _save_groups(self):
+        try:
+            with open(self.groups_file, 'w', encoding='utf-8') as f:
+                json.dump({
+                    "groups": self.groups,
+                    "active_group_id": self._active_group_id
+                }, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            logger.error(f"Ошибка при сохранении групп: {e}")
+    
+    def get_all(self) -> List[Dict[str, Any]]:
+        return list(self.groups)
+    
+    def add_group(self, group_id: str, title: str = "") -> bool:
+        gid = str(group_id)
+        for g in self.groups:
+            if str(g.get("group_id")) == gid:
+                g["title"] = title or g.get("title", "")
+                self._save_groups()
+                return True
+        self.groups.append({"group_id": gid, "title": title or f"Группа {gid}"})
+        self._save_groups()
+        return True
+    
+    def set_active(self, group_id: str) -> bool:
+        gid = str(group_id)
+        for g in self.groups:
+            if str(g.get("group_id")) == gid:
+                self._active_group_id = gid
+                self._save_groups()
+                return True
+        self._active_group_id = gid
+        self.groups.append({"group_id": gid, "title": f"Группа {gid}"})
+        self._save_groups()
+        return True
+    
+    def get_active(self) -> Optional[str]:
+        if self._active_group_id:
+            return self._active_group_id
+        if self.groups:
+            return str(self.groups[0].get("group_id"))
+        return None
+
 class Settings:
     """
     Класс для управления настройками приложения через переменные окружения.
@@ -200,13 +311,20 @@ class Settings:
         if not self.admin_chat_id:
             logger.warning("ADMIN_CHAT_ID не установлен. Статусные сообщения не будут отправляться.")
         
+        # Режим Zapier: публикация в Telegram идёт через Zapier (авторизация бота/группы в Zapier)
+        self.zapier_mode = os.getenv("ZAPIER_MODE", "").strip().lower() in ("1", "true", "yes")
+        if self.zapier_mode:
+            logger.info("ZAPIER_MODE включён: публикация в Telegram через Zapier (бот и группа настраиваются в Zapier).")
+        
         # Проверка критически важных настроек
-        if not all([self.telegram_token, self.telegram_group_id]):
+        if not self.zapier_mode and not all([self.telegram_token, self.telegram_group_id]):
             logger.critical("Не все необходимые переменные окружения установлены. Приложение может работать некорректно.")
     
     def validate(self) -> bool:
-        """Проверяет, что все необходимые настройки присутствуют"""
-        return all([self.telegram_token, self.telegram_group_id])
+        """Проверяет, что все необходимые настройки присутствуют."""
+        if self.zapier_mode:
+            return bool(self.telegram_token)  # для бота-администратора; публикация — через Zapier
+        return bool(self.telegram_token) and bool(get_active_group_id())
 
 # Инициализация настроек
 settings = Settings()
@@ -214,6 +332,52 @@ settings = Settings()
 # Инициализация менеджеров
 schedule_manager = ScheduleManager()
 stats_manager = StatsManager()
+groups_manager = GroupsManager()
+# Если в .env задана одна группа, добавляем её в список при первом запуске
+if settings.telegram_group_id and not groups_manager.get_all():
+    groups_manager.add_group(settings.telegram_group_id, "Группа по умолчанию")
+    groups_manager.set_active(settings.telegram_group_id)
+
+def get_active_group_id() -> Optional[str]:
+    """ID группы для публикации: из списка групп или из TELEGRAM_GROUP_ID."""
+    return groups_manager.get_active() or settings.telegram_group_id
+
+async def _scheduler_loop():
+    """Фоновый цикл: публикация по расписанию (время и частота из бота-администратора). В режиме Zapier публикация идёт через Zapier — планировщик не постит."""
+    if settings.zapier_mode:
+        logger.info("Планировщик: режим Zapier — публикация по расписанию через Zapier (опрос /zapier/should-post).")
+        while True:
+            await asyncio.sleep(3600)
+        return
+    logger.info("Планировщик публикаций запущен")
+    while True:
+        try:
+            await asyncio.sleep(60)  # проверка раз в минуту
+            if not schedule_manager.is_enabled():
+                continue
+            next_run = schedule_manager.get_next_run_at()
+            if next_run and datetime.now() >= next_run:
+                logger.info("Запуск публикации по расписанию")
+                await generate_and_publish_post(background=True)
+        except asyncio.CancelledError:
+            logger.info("Планировщик публикаций остановлен")
+            break
+        except Exception as e:
+            logger.exception(f"Ошибка в планировщике: {e}")
+
+_scheduler_task: Optional[asyncio.Task] = None
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global _scheduler_task
+    _scheduler_task = asyncio.create_task(_scheduler_loop())
+    yield
+    if _scheduler_task:
+        _scheduler_task.cancel()
+        try:
+            await _scheduler_task
+        except asyncio.CancelledError:
+            pass
 
 # Инициализация FastAPI приложения
 app = FastAPI(
@@ -223,7 +387,8 @@ app = FastAPI(
     contact={
         "name": "Support",
         "email": "support@example.com",
-    }
+    },
+    lifespan=lifespan,
 )
 
 # Модель для ответа API
@@ -347,7 +512,7 @@ async def get_latest_message() -> Optional[str]:
         for update in reversed(response_data["result"]):
             if "message" in update:
                 message = update["message"]
-                if str(message.get("chat", {}).get("id")) == str(settings.telegram_group_id):
+                if str(message.get("chat", {}).get("id")) == str(get_active_group_id()):
                     return message.get("text")
         return None
         
@@ -613,6 +778,78 @@ async def generate_image(image_prompt: str) -> Optional[str]:
         await send_status_message(error_msg)
         return None
 
+def _save_generated_post_to_file(
+    post_text: str,
+    image_prompt: Optional[str] = None,
+    image_url: Optional[str] = None,
+) -> None:
+    """
+    Сохраняет сгенерированный пост и метаданные в файлы на сервере
+    (для аналитики и архива по требованию проекта).
+    """
+    data_dir = Path("data")
+    posts_dir = data_dir / "generated_posts"
+    posts_dir.mkdir(parents=True, exist_ok=True)
+    now = datetime.now()
+    ts = now.strftime("%Y-%m-%d_%H-%M-%S")
+    payload = {
+        "timestamp": now.isoformat(),
+        "text": post_text,
+        "image_prompt": image_prompt,
+        "image_url": image_url,
+    }
+    try:
+        path = posts_dir / f"{ts}.json"
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+        last_post_path = data_dir / "last_post.json"
+        with open(last_post_path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+        logger.info(f"Сгенерированный пост сохранён: {path}, last_post.json")
+    except Exception as e:
+        logger.exception(f"Ошибка сохранения поста в файл: {e}")
+
+def _split_post_for_caption_and_body(post_text: str) -> Tuple[str, str]:
+    """Разбивает текст поста на заголовок (caption для фото) и основной текст, как в Telegram."""
+    lines = post_text.split('\n')
+    title = lines[0] if lines else "Путешествия"
+    content_start = 1
+    for i, line in enumerate(lines):
+        if i > 0 and line.strip() == '':
+            content_start = i + 1
+            break
+    body = '\n'.join(lines[content_start:]) if content_start < len(lines) else ""
+    return title[:1024], body
+
+async def _generate_post_content_for_zapier() -> Optional[Dict[str, Any]]:
+    """
+    Генерирует пост (текст + изображение) и возвращает данные для публикации через Zapier.
+    Не публикует в Telegram. Сохраняет контент в файл.
+    """
+    if not settings.openai_api_key:
+        logger.warning("OPENAI_API_KEY не установлен, генерация для Zapier недоступна")
+        return None
+    try:
+        latest_comment = await get_latest_message()
+        if latest_comment and await is_travel_related(latest_comment):
+            generated_post = await generate_post(latest_comment)
+        else:
+            generated_post = await generate_post()
+        image_prompt = await generate_image_prompt(generated_post)
+        image_url = await generate_image(image_prompt)
+        _save_generated_post_to_file(generated_post, image_prompt, image_url)
+        photo_caption, body_text = _split_post_for_caption_and_body(generated_post)
+        return {
+            "photo_url": image_url,
+            "photo_caption": photo_caption,
+            "body_text": body_text.strip(),
+            "full_text": generated_post,
+            "timestamp": datetime.now().isoformat(),
+        }
+    except Exception as e:
+        logger.exception(f"Ошибка генерации контента для Zapier: {e}")
+        return None
+
 async def send_post_with_image(image_url: Optional[str], post_text: str) -> Tuple[Optional[str], Optional[str]]:
     """
     Публикует пост с изображением в Telegram.
@@ -646,7 +883,7 @@ async def send_post_with_image(image_url: Optional[str], post_text: str) -> Tupl
             # Отправляем изображение с заголовком в caption
             photo_url = f"https://api.telegram.org/bot{settings.telegram_token}/sendPhoto"
             photo_payload = {
-                "chat_id": settings.telegram_group_id,
+                "chat_id": get_active_group_id(),
                 "photo": image_url,
                 "caption": title[:1024],  # Ограничение Telegram на длину caption
                 "parse_mode": "HTML"
@@ -698,7 +935,7 @@ async def send_to_telegram(text: str) -> Optional[str]:
     try:
         url = f"https://api.telegram.org/bot{settings.telegram_token}/sendMessage"
         payload = {
-            "chat_id": settings.telegram_group_id,
+            "chat_id": get_active_group_id(),
             "text": text,
             "parse_mode": "HTML",
             "disable_web_page_preview": False
@@ -747,7 +984,7 @@ async def get_post_statistics(post_id: str) -> Tuple[int, int]:
     try:
         # Получаем информацию о сообщении
         url = f"https://api.telegram.org/bot{settings.telegram_token}/getChat"
-        chat_response = await asyncio.to_thread(requests.get, url, params={"chat_id": settings.telegram_group_id})
+        chat_response = await asyncio.to_thread(requests.get, url, params={"chat_id": get_active_group_id()})
         
         # Для получения статистики нужно использовать getChatMemberCount или forwardMessage
         # Но Telegram API не предоставляет прямого способа получить просмотры/комментарии
@@ -796,7 +1033,8 @@ async def handle_bot_command(command: str, chat_id: str, message_text: str = "")
     command = command.lower().strip()
     
     if command == "/start" or command == "/help":
-        return """🤖 <b>SMM-эксперт путешественника</b>
+        zapier_note = "\n📌 <i>Публикация в Telegram идёт через Zapier (бот и группа подключаются в Zapier).</i>\n" if settings.zapier_mode else ""
+        return f"""🤖 <b>SMM-эксперт путешественника</b>{zapier_note}
 
 <b>Доступные команды:</b>
 /schedule - Показать текущее расписание публикаций
@@ -804,7 +1042,9 @@ async def handle_bot_command(command: str, chat_id: str, message_text: str = "")
 /setfreq N - Установить частоту публикаций в часах (например: /setfreq 24)
 /stats - Показать статистику вовлеченности за последние 7 дней
 /stats N - Показать статистику за последние N дней
-/groups - Показать список групп, где бот является администратором
+/groups - Список групп для публикаций
+/setgroup ID - Выбрать активную группу для публикаций
+/addgroup - Добавить группу (отправьте в чате группы, где бот админ)
 /nextpost - Показать информацию о следующем запланированном посте
 
 Примеры:
@@ -897,34 +1137,33 @@ async def handle_bot_command(command: str, chat_id: str, message_text: str = "")
     
     elif command == "/groups":
         try:
-            # Получаем список групп, где бот является администратором
-            url = f"https://api.telegram.org/bot{settings.telegram_token}/getChat"
-            response = await asyncio.to_thread(requests.get, url, params={"chat_id": settings.telegram_group_id})
-            chat_data = response.json()
-            
-            if chat_data.get("ok"):
-                chat = chat_data["result"]
-                response = f"👥 <b>Текущая группа:</b>\n\n"
-                response += f"📝 <b>Название:</b> {chat.get('title', 'Неизвестно')}\n"
-                response += f"🆔 <b>ID:</b> {chat.get('id')}\n"
-                response += f"📋 <b>Тип:</b> {chat.get('type', 'Неизвестно')}\n"
-                
-                # Проверяем права бота
-                member_url = f"https://api.telegram.org/bot{settings.telegram_token}/getChatMember"
-                member_response = await asyncio.to_thread(
-                    requests.get, 
-                    member_url, 
-                    params={"chat_id": settings.telegram_group_id, "user_id": settings.telegram_token.split(':')[0]}
-                )
-                # Это упрощенная версия, в реальности нужно использовать правильный user_id бота
-                
-                return response
-            else:
-                return "❌ Не удалось получить информацию о группе."
-                
+            all_groups = groups_manager.get_all()
+            active_id = get_active_group_id()
+            if not all_groups and active_id:
+                all_groups = [{"group_id": active_id, "title": "Группа из TELEGRAM_GROUP_ID"}]
+            resp = "👥 <b>Группы для публикаций</b>\n\n"
+            for i, g in enumerate(all_groups, 1):
+                gid = str(g.get("group_id", ""))
+                title = g.get("title", gid)
+                mark = " ✅ (активная)" if gid == str(active_id) else ""
+                resp += f"{i}. {title}\n   ID: <code>{gid}</code>{mark}\n\n"
+            resp += "Используйте /setgroup ID чтобы выбрать группу, /addgroup — добавить группу (отправьте в чате группы)."
+            return resp
         except Exception as e:
             logger.exception(f"Ошибка при получении информации о группах: {e}")
-            return f"❌ Ошибка при получении информации о группах: {str(e)}"
+            return f"❌ Ошибка: {str(e)}"
+    
+    elif command.startswith("/setgroup"):
+        parts = message_text.split(maxsplit=1)
+        if len(parts) < 2:
+            return "❌ Используйте: /setgroup ID_группы\nПример: /setgroup -1001234567890"
+        gid = parts[1].strip()
+        if groups_manager.set_active(gid):
+            return f"✅ Активная группа установлена: <code>{gid}</code>"
+        return f"❌ Не удалось установить группу {gid}"
+    
+    elif command == "/addgroup":
+        return "📌 Отправьте /addgroup в чате той группы, куда добавлен бот — группа будет добавлена в список. Либо добавьте группу вручную: /setgroup ID_группы"
     
     elif command == "/nextpost":
         next_time = schedule_manager.get_next_post_time()
@@ -993,7 +1232,30 @@ async def generate_and_publish_post(background: bool = False) -> Dict[str, Any]:
         await send_status_message("🖼️ Генерируем изображение через DALL-E...")
         image_url = await generate_image(image_prompt)
         
-        # Публикуем пост с изображением
+        # Сохраняем сгенерированный контент в файл на сервере (аналитика и архив)
+        _save_generated_post_to_file(generated_post, image_prompt, image_url)
+        
+        # В режиме Zapier не публикуем в Telegram — публикация идёт через Zapier
+        if settings.zapier_mode:
+            photo_caption, body_text = _split_post_for_caption_and_body(generated_post)
+            result = {
+                "status": "success",
+                "message": "Контент сгенерирован для публикации через Zapier",
+                "timestamp": datetime.now().isoformat(),
+                "processing_time": (datetime.now() - start_time).total_seconds(),
+                "zapier_payload": {
+                    "photo_url": image_url,
+                    "photo_caption": photo_caption,
+                    "body_text": body_text.strip(),
+                    "full_text": generated_post,
+                },
+            }
+            await send_status_message("✅ Пост сгенерирован для Zapier. Опубликуйте его через Zapier (Telegram).")
+            if schedule_manager.is_enabled():
+                schedule_manager.set_next_run_after_publish()
+            return result
+        
+        # Публикуем пост с изображением в Telegram (не Zapier)
         await send_status_message("📤 Публикуем пост с изображением...")
         photo_id, text_id = await send_post_with_image(image_url, generated_post)
         
@@ -1019,6 +1281,10 @@ async def generate_and_publish_post(background: bool = False) -> Dict[str, Any]:
             # Пытаемся получить начальную статистику
             # В фоне обновим статистику позже
             asyncio.create_task(update_post_stats_async(post_id_for_stats))
+        
+        # Обновляем следующее время публикации по расписанию
+        if schedule_manager.is_enabled():
+            schedule_manager.set_next_run_after_publish()
         
         # Отправляем статусное сообщение об успехе
         status_msg = "✅ Пост успешно опубликован!\n"
@@ -1057,7 +1323,8 @@ async def health_check():
     
     details = {
         "openai_api_configured": bool(settings.openai_api_key),
-        "telegram_configured": bool(settings.telegram_token and settings.telegram_group_id),
+        "zapier_mode": settings.zapier_mode,
+        "telegram_configured": bool(settings.telegram_token and (get_active_group_id() or settings.zapier_mode)),
         "admin_notifications": bool(settings.admin_chat_id)
     }
     
@@ -1122,6 +1389,19 @@ async def telegram_webhook(request: Request):
         # Извлекаем команду
         parts = text.split(maxsplit=1)
         command = parts[0]
+        chat = message.get("chat", {})
+        chat_type = chat.get("type", "")
+        from_id = str(message.get("from", {}).get("id", ""))
+        is_admin = settings.admin_chat_id and from_id == str(settings.admin_chat_id)
+        
+        # Добавление группы: /addgroup отправлено в чате группы администратором
+        if command == "/addgroup" and chat_type in ("group", "supergroup") and is_admin:
+            title = chat.get("title", f"Группа {chat_id}")
+            groups_manager.add_group(chat_id, title)
+            groups_manager.set_active(chat_id)
+            response_text = f"✅ Группа добавлена и выбрана для публикаций:\n📝 {title}\n🆔 <code>{chat_id}</code>"
+            await send_telegram_message(chat_id, response_text)
+            return JSONResponse(content={"ok": True})
         
         # Обрабатываем команду
         response_text = await handle_bot_command(command, chat_id, text)
@@ -1134,6 +1414,66 @@ async def telegram_webhook(request: Request):
     except Exception as e:
         logger.exception(f"Ошибка при обработке webhook: {e}")
         return JSONResponse(content={"ok": False, "error": str(e)}, status_code=500)
+
+# ====== ЭНДПОИНТЫ ДЛЯ ZAPIER ======
+# Публикация в Telegram идёт через Zapier: авторизация бота/группы в Zapier,
+# расписание и частота задаются в боте-администраторе; Zapier опрашивает should-post и публикует.
+
+@app.get("/zapier/should-post")
+async def zapier_should_post():
+    """
+    Опрос для Zapier: пора ли публиковать пост по расписанию.
+    Zapier вызывает этот URL по расписанию (например каждые 15 мин).
+    Если пора — возвращаем контент поста; Zapier отправляет его в Telegram своим шагом.
+    """
+    if not settings.zapier_mode:
+        return JSONResponse(
+            content={"should_post": False, "post": None, "error": "ZAPIER_MODE не включён"},
+            status_code=400,
+        )
+    if not schedule_manager.is_enabled():
+        return JSONResponse(content={"should_post": False, "post": None})
+    next_run = schedule_manager.get_next_run_at()
+    if not next_run or datetime.now() < next_run:
+        return JSONResponse(content={"should_post": False, "post": None})
+    # Время пришло — генерируем контент и возвращаем для публикации через Zapier
+    post_data = await _generate_post_content_for_zapier()
+    if not post_data:
+        return JSONResponse(
+            content={"should_post": False, "post": None, "error": "Не удалось сгенерировать контент"},
+            status_code=500,
+        )
+    schedule_manager.set_next_run_after_publish()
+    return JSONResponse(content={"should_post": True, "post": post_data})
+
+@app.get("/zapier/schedule")
+async def zapier_schedule():
+    """Текущее расписание (время и частота из бота-администратора) для настройки Zapier."""
+    return JSONResponse(content={
+        "next_post_time": schedule_manager.get_next_post_time(),
+        "frequency_hours": schedule_manager.get_frequency(),
+        "enabled": schedule_manager.is_enabled(),
+        "next_run_at": schedule_manager.schedule.get("next_run_at"),
+    })
+
+@app.post("/zapier/generate-post")
+async def zapier_generate_post():
+    """
+    Генерация поста по запросу (для ручного Zap в Zapier или теста).
+    Возвращает контент для публикации в Telegram через Zapier; не проверяет расписание.
+    """
+    if not settings.zapier_mode:
+        return JSONResponse(
+            content={"error": "ZAPIER_MODE не включён"},
+            status_code=400,
+        )
+    post_data = await _generate_post_content_for_zapier()
+    if not post_data:
+        return JSONResponse(
+            content={"error": "Не удалось сгенерировать контент"},
+            status_code=500,
+        )
+    return JSONResponse(content=post_data)
 
 @app.get("/schedule", response_model=ScheduleResponse)
 async def get_schedule():
