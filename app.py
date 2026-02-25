@@ -628,6 +628,29 @@ async def send_telegram_message(
         logger.exception(f"Ошибка при отправке сообщения в Telegram: {str(e)}")
         return False
 
+async def send_telegram_photo(chat_id: str, photo_url: str, caption: str = "") -> bool:
+    """Отправляет фото по URL в указанный чат Telegram."""
+    if not settings.telegram_token or not photo_url:
+        return False
+    try:
+        url = f"https://api.telegram.org/bot{settings.telegram_token}/sendPhoto"
+        payload = {
+            "chat_id": chat_id,
+            "photo": photo_url,
+            "parse_mode": "HTML",
+        }
+        if caption:
+            payload["caption"] = caption[:1024]
+        response = await asyncio.to_thread(requests.post, url, data=payload)
+        response_data = response.json()
+        if response_data.get("ok"):
+            return True
+        logger.error(f"Ошибка при отправке фото: {response_data.get('description')}")
+        return False
+    except Exception as e:
+        logger.exception(f"Ошибка при отправке фото в Telegram: {str(e)}")
+        return False
+
 async def send_status_message(message: str) -> bool:
     """
     Отправляет статусное сообщение администратору через Telegram.
@@ -654,6 +677,37 @@ async def get_latest_message() -> Optional[str]:
     Прямые вызовы getUpdates не используются, чтобы не конфликтовать с webhook.
     """
     return comments_manager.get_latest_comment_any()
+
+async def do_generate_now(admin_chat_id: str) -> None:
+    """
+    Генерация поста без расписания: отправляет фото и текст админу, при наличии группы — публикует в группу.
+    """
+    post_data = await _generate_post_content_for_zapier()
+    if not post_data:
+        await send_telegram_message(admin_chat_id, "❌ Не удалось сгенерировать пост. Проверьте OPENAI_API_KEY и логи сервера.")
+        return
+    caption = post_data.get("photo_caption") or ""
+    body = post_data.get("body_text") or ""
+    image_url = post_data.get("photo_url") or ""
+    full_text = post_data.get("full_text") or f"{caption}\n\n{body}"
+    # Админу: фото с подписью и отдельно текст (или только текст, если нет фото)
+    if image_url:
+        await send_telegram_photo(
+            admin_chat_id,
+            image_url,
+            caption=f"✅ <b>Пост без расписания</b>\n\n{caption}",
+        )
+    if body.strip():
+        await send_telegram_message(admin_chat_id, body)
+    elif not image_url and full_text.strip():
+        await send_telegram_message(admin_chat_id, "✅ <b>Пост без расписания</b>\n\n" + full_text)
+    # Публикация в группу, если задана
+    group_id = get_active_group_id()
+    if group_id and (image_url or full_text.strip()):
+        await send_post_with_image(image_url, full_text)
+        await send_telegram_message(admin_chat_id, "📤 Пост опубликован в группу.")
+    elif not group_id:
+        await send_telegram_message(admin_chat_id, "💡 Чтобы публиковать в группу, задайте TELEGRAM_GROUP_ID или добавьте группу через /addgroup.")
 
 async def is_travel_related(comment: str) -> bool:
     """
@@ -1206,19 +1260,8 @@ async def handle_bot_command(command: str, chat_id: str, message_text: str = "")
         return response
     
     elif command == "/generate_now":
-        post_data = await _generate_post_content_for_zapier()
-        if not post_data:
-            return "❌ Не удалось сгенерировать пост. Проверьте OPENAI_API_KEY и логи сервера."
-        caption = post_data.get("photo_caption") or ""
-        body = post_data.get("body_text") or ""
-        image_url = post_data.get("photo_url") or ""
-        response = "✅ <b>Пост сгенерирован без расписания</b>\n\n"
-        if image_url:
-            response += f"🖼️ <b>Изображение:</b> {image_url}\n\n"
-        response += f"<b>Заголовок:</b>\n{caption}\n\n"
-        if body:
-            response += f"<b>Текст:</b>\n{body}"
-        return response
+        # Обработка вынесена в do_generate_now (фото + публикация в группу)
+        return ""
     
     elif command.startswith("/settime"):
         # Парсим время из команды /settime HH:MM
@@ -1587,6 +1630,12 @@ async def telegram_webhook(request: Request):
             groups_manager.set_active(chat_id)
             response_text = f"✅ Группа добавлена и выбрана для публикаций:\n📝 {title}\n🆔 <code>{chat_id}</code>"
             await send_telegram_message(chat_id, response_text)
+            return JSONResponse(content={"ok": True})
+        
+        # Генерация без расписания: фото админу и публикация в группу
+        if command == "/generate_now" and is_admin:
+            await send_telegram_message(chat_id, "🔄 Генерирую пост...")
+            await do_generate_now(chat_id)
             return JSONResponse(content={"ok": True})
         
         # Обрабатываем команду
