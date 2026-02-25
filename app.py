@@ -1023,15 +1023,21 @@ async def _generate_post_content_for_zapier() -> Optional[Dict[str, Any]]:
     """
     Генерирует пост (текст + изображение) и возвращает данные для публикации через Zapier.
     Не публикует в Telegram. Сохраняет контент в файл.
+    При ошибке из-за комментария откатывается на генерацию без комментария.
     """
     if not settings.openai_api_key:
         logger.warning("OPENAI_API_KEY не установлен, генерация для Zapier недоступна")
         return None
     try:
         latest_comment = comments_manager.get_latest_comment_any()
-        if latest_comment and await is_travel_related(latest_comment):
-            generated_post = await generate_post(latest_comment)
-        else:
+        generated_post = None
+        if latest_comment and latest_comment.strip():
+            try:
+                if await is_travel_related(latest_comment):
+                    generated_post = await generate_post(latest_comment)
+            except Exception as e:
+                logger.warning(f"Комментарий не использован (ошибка проверки/генерации), генерируем без него: {e}")
+        if generated_post is None:
             generated_post = await generate_post()
         image_prompt = await generate_image_prompt(generated_post)
         image_url = await generate_image(image_prompt)
@@ -1046,6 +1052,7 @@ async def _generate_post_content_for_zapier() -> Optional[Dict[str, Any]]:
         }
     except Exception as e:
         logger.exception(f"Ошибка генерации контента для Zapier: {e}")
+        await send_status_message(f"⚠️ Ошибка генерации поста (Zapier/расписание): {str(e)[:200]}")
         return None
 
 async def send_post_with_image(image_url: Optional[str], post_text: str) -> Tuple[Optional[str], Optional[str]]:
@@ -1446,16 +1453,20 @@ async def generate_and_publish_post(background: bool = False) -> Dict[str, Any]:
         }
     
     try:
-        # Получаем последний комментарий (через Zapier CommentsManager)
-        await send_status_message("🔍 Ищем последний комментарий из группы (через Zapier)...")
+        # Получаем последний комментарий из группы
+        await send_status_message("🔍 Ищем последний комментарий из группы...")
         latest_comment = comments_manager.get_latest_comment_any()
-        
-        # Генерируем пост
-        if latest_comment and await is_travel_related(latest_comment):
-            await send_status_message("💬 Найден релевантный комментарий. Генерируем персонализированный пост...")
-            logger.info(f"Используем комментарий для персонализации: {latest_comment[:100]}...")
-            generated_post = await generate_post(latest_comment)
-        else:
+        generated_post = None
+        if latest_comment and latest_comment.strip():
+            try:
+                if await is_travel_related(latest_comment):
+                    await send_status_message("💬 Найден релевантный комментарий. Генерируем персонализированный пост...")
+                    logger.info(f"Используем комментарий для персонализации: {latest_comment[:100]}...")
+                    generated_post = await generate_post(latest_comment)
+            except Exception as e:
+                logger.warning(f"Комментарий не использован, генерируем без него: {e}")
+                await send_status_message(f"💬 Комментарий пропущен (ошибка), генерируем стандартный пост.")
+        if generated_post is None:
             await send_status_message("📝 Генерируем стандартный пост...")
             generated_post = await generate_post()
         
@@ -1709,6 +1720,7 @@ async def zapier_should_post():
     # Время пришло — генерируем контент и возвращаем для публикации через Zapier
     post_data = await _generate_post_content_for_zapier()
     if not post_data:
+        await send_status_message("❌ Zapier: не удалось сгенерировать контент. Проверьте логи и OPENAI_API_KEY.")
         return JSONResponse(
             content={"should_post": False, "post": None, "error": "Не удалось сгенерировать контент"},
             status_code=500,
