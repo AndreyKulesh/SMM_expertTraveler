@@ -104,7 +104,7 @@ class ScheduleManager:
         if post_time and ":" in str(post_time) and len(str(post_time)) <= 5:
             try:
                 hour, minute = map(int, str(post_time).strip().split(":")[:2])
-                now = datetime.now()
+                now = datetime.now(timezone.utc)
                 candidate = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
                 if candidate <= now:
                     candidate += timedelta(days=1)
@@ -131,12 +131,19 @@ class ScheduleManager:
         self.schedule["enabled"] = enabled
         self._save_schedule()
     
+    def _ensure_utc(self, dt: datetime) -> datetime:
+        """Приводит datetime к UTC (для сравнения без ошибки naive/aware)."""
+        if dt.tzinfo is None:
+            return dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+    
     def get_next_run_at(self) -> Optional[datetime]:
-        """Возвращает datetime следующей запланированной публикации (для планировщика)."""
+        """Возвращает datetime следующей запланированной публикации (UTC, для планировщика)."""
         next_run = self.schedule.get("next_run_at")
         if next_run:
             try:
-                return datetime.fromisoformat(next_run)
+                parsed = datetime.fromisoformat(str(next_run).replace("Z", "+00:00"))
+                return self._ensure_utc(parsed)
             except (ValueError, TypeError):
                 pass
         # Вычисляем из next_post_time (HH:MM)
@@ -145,7 +152,7 @@ class ScheduleManager:
             return None
         try:
             hour, minute = map(int, str(time_str).strip().split(":")[:2])
-            now = datetime.now()
+            now = datetime.now(timezone.utc)
             candidate = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
             if candidate <= now:
                 candidate += timedelta(days=1)
@@ -161,8 +168,8 @@ class ScheduleManager:
         self._save_schedule()
     
     def set_next_run_after_publish(self):
-        """Вызвать после публикации: следующий запуск = сейчас + frequency_hours."""
-        self.schedule["next_run_at"] = (datetime.now() + timedelta(hours=self.get_frequency())).isoformat()
+        """Вызвать после публикации: следующий запуск = сейчас + frequency_hours (UTC)."""
+        self.schedule["next_run_at"] = (datetime.now(timezone.utc) + timedelta(hours=self.get_frequency())).isoformat()
         self._save_schedule()
 
 class StatsManager:
@@ -507,7 +514,7 @@ async def _scheduler_loop():
             if not schedule_manager.is_enabled():
                 continue
             next_run = schedule_manager.get_next_run_at()
-            if next_run and datetime.now() >= next_run:
+            if next_run and datetime.now(timezone.utc) >= next_run:
                 logger.info("Запуск публикации по расписанию")
                 await generate_and_publish_post(background=True)
         except asyncio.CancelledError:
@@ -1697,7 +1704,7 @@ async def zapier_should_post():
     if not schedule_manager.is_enabled():
         return JSONResponse(content={"should_post": False, "post": None})
     next_run = schedule_manager.get_next_run_at()
-    if not next_run or datetime.now() < next_run:
+    if not next_run or datetime.now(timezone.utc) < next_run:
         return JSONResponse(content={"should_post": False, "post": None})
     # Время пришло — генерируем контент и возвращаем для публикации через Zapier
     post_data = await _generate_post_content_for_zapier()
