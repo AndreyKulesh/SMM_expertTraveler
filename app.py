@@ -15,7 +15,7 @@ import os
 import logging
 import asyncio
 import json
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Optional, Dict, Tuple, Any, List
 from pathlib import Path
 
@@ -27,10 +27,21 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from dotenv import load_dotenv
 
+import database as db
+
+try:
+    from zoneinfo import ZoneInfo
+except Exception:  # pragma: no cover - для совместимости, если zoneinfo недоступен
+    ZoneInfo = None
+
 # Загрузка переменных окружения из .env файла (только для локальной разработки)
-# В production на Koyeb переменные окружения будут заданы через интерфейс
+# В production на Render переменные окружения задаются в дашборде
 if os.path.exists('.env'):
     load_dotenv()
+
+# Инициализация БД при наличии DATABASE_URL (таблицы создаются до инициализации менеджеров)
+if os.getenv("DATABASE_URL"):
+    db.init_db()
 
 # Настройка логгера
 logging.basicConfig(
@@ -43,29 +54,40 @@ logging.basicConfig(
 logger = logging.getLogger("travel-post-generator")
 
 class ScheduleManager:
-    """Управление расписанием публикаций"""
+    """Управление расписанием публикаций (файл или PostgreSQL при DATABASE_URL)."""
     
+    _default_schedule = {
+        "next_post_time": None,
+        "frequency_hours": 24,
+        "enabled": True,
+        "next_run_at": None,
+    }
+
     def __init__(self, schedule_file: str = "schedule.json"):
         self.schedule_file = Path(schedule_file)
+        self._use_db = bool(os.getenv("DATABASE_URL"))
         self.schedule = self._load_schedule()
     
     def _load_schedule(self) -> Dict[str, Any]:
-        """Загружает расписание из файла"""
+        """Загружает расписание из БД или файла"""
+        if self._use_db:
+            data = db.db_schedule_load()
+            if data:
+                return data
+            return dict(self._default_schedule)
         if self.schedule_file.exists():
             try:
                 with open(self.schedule_file, 'r', encoding='utf-8') as f:
                     return json.load(f)
             except Exception as e:
                 logger.error(f"Ошибка при загрузке расписания: {e}")
-        return {
-            "next_post_time": None,
-            "frequency_hours": 24,
-            "enabled": True,
-            "next_run_at": None  # ISO datetime следующего запуска
-        }
+        return dict(self._default_schedule)
     
     def _save_schedule(self):
-        """Сохраняет расписание в файл"""
+        """Сохраняет расписание в БД или файл"""
+        if self._use_db:
+            if db.db_schedule_save(self.schedule):
+                return
         try:
             with open(self.schedule_file, 'w', encoding='utf-8') as f:
                 json.dump(self.schedule, f, ensure_ascii=False, indent=2)
@@ -144,14 +166,17 @@ class ScheduleManager:
         self._save_schedule()
 
 class StatsManager:
-    """Управление статистикой вовлеченности"""
+    """Управление статистикой вовлеченности (файл или PostgreSQL при DATABASE_URL)."""
     
     def __init__(self, stats_file: str = "stats.json"):
         self.stats_file = Path(stats_file)
+        self._use_db = bool(os.getenv("DATABASE_URL"))
         self.stats = self._load_stats()
     
     def _load_stats(self) -> Dict[str, Any]:
-        """Загружает статистику из файла"""
+        """Загружает статистику из файла (при БД в памяти не храним список постов)."""
+        if self._use_db:
+            return {"posts": []}
         if self.stats_file.exists():
             try:
                 with open(self.stats_file, 'r', encoding='utf-8') as f:
@@ -161,7 +186,9 @@ class StatsManager:
         return {"posts": []}
     
     def _save_stats(self):
-        """Сохраняет статистику в файл"""
+        """Сохраняет статистику в файл (при БД не используется)."""
+        if self._use_db:
+            return
         try:
             with open(self.stats_file, 'w', encoding='utf-8') as f:
                 json.dump(self.stats, f, ensure_ascii=False, indent=2)
@@ -170,6 +197,9 @@ class StatsManager:
     
     def add_post(self, post_id: str, text_id: Optional[str] = None, photo_id: Optional[str] = None):
         """Добавляет информацию о новом посте"""
+        if self._use_db:
+            db.db_stats_add_post(post_id, text_id, photo_id)
+            return
         post_data = {
             "post_id": post_id,
             "text_id": text_id,
@@ -181,13 +211,15 @@ class StatsManager:
         if "posts" not in self.stats:
             self.stats["posts"] = []
         self.stats["posts"].append(post_data)
-        # Храним только последние 100 постов
         if len(self.stats["posts"]) > 100:
             self.stats["posts"] = self.stats["posts"][-100:]
         self._save_stats()
     
     def update_post_stats(self, post_id: str, views: Optional[int] = None, comments: Optional[int] = None):
         """Обновляет статистику поста"""
+        if self._use_db:
+            db.db_stats_update_post(post_id, views, comments)
+            return
         for post in self.stats.get("posts", []):
             if post.get("post_id") == post_id or post.get("text_id") == post_id or post.get("photo_id") == post_id:
                 if views is not None:
@@ -195,22 +227,22 @@ class StatsManager:
                 if comments is not None:
                     post["comments"] = comments
                 self._save_stats()
-                return True
-        return False
+                return
+        return
     
     def get_recent_stats(self, days: int = 7) -> Dict[str, Any]:
         """Возвращает статистику за последние N дней"""
+        if self._use_db:
+            return db.db_stats_get_recent(days)
         cutoff_date = datetime.now() - timedelta(days=days)
         recent_posts = [
             post for post in self.stats.get("posts", [])
             if datetime.fromisoformat(post["timestamp"]) >= cutoff_date
         ]
-        
         total_views = sum(post.get("views", 0) for post in recent_posts)
         total_comments = sum(post.get("comments", 0) for post in recent_posts)
         avg_views = total_views / len(recent_posts) if recent_posts else 0
         avg_comments = total_comments / len(recent_posts) if recent_posts else 0
-        
         return {
             "period_days": days,
             "total_posts": len(recent_posts),
@@ -218,32 +250,108 @@ class StatsManager:
             "total_comments": total_comments,
             "avg_views": round(avg_views, 1),
             "avg_comments": round(avg_comments, 1),
-            "posts": recent_posts[-10:]  # Последние 10 постов
+            "posts": recent_posts[-10:]
         }
 
+
+class CommentsManager:
+    """Хранение последних комментариев из группы (через Zapier). Файл или PostgreSQL при DATABASE_URL."""
+
+    def __init__(self, comments_file: str = "comments.json"):
+        self.comments_file = Path(comments_file)
+        self._use_db = bool(os.getenv("DATABASE_URL"))
+        self.comments = self._load_comments()
+
+    def _load_comments(self) -> Dict[str, Any]:
+        if self._use_db:
+            return {"comments": []}
+        if self.comments_file.exists():
+            try:
+                with open(self.comments_file, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                    if isinstance(data, dict):
+                        return data
+            except Exception as e:
+                logger.error(f"Ошибка при загрузке комментариев: {e}")
+        return {"comments": []}
+
+    def _save_comments(self) -> None:
+        if self._use_db:
+            return
+        try:
+            with open(self.comments_file, "w", encoding="utf-8") as f:
+                json.dump(self.comments, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            logger.error(f"Ошибка при сохранении комментариев: {e}")
+
+    def add_comment(
+        self,
+        chat_id: str,
+        message_id: Optional[str],
+        text: str,
+        timestamp: Optional[str] = None,
+    ) -> None:
+        if self._use_db:
+            db.db_comments_add(chat_id, message_id, text, timestamp)
+            return
+        if "comments" not in self.comments:
+            self.comments["comments"] = []
+        self.comments["comments"].append(
+            {
+                "chat_id": str(chat_id),
+                "message_id": str(message_id) if message_id is not None else None,
+                "text": text,
+                "timestamp": timestamp or datetime.now().isoformat(),
+            }
+        )
+        if len(self.comments["comments"]) > 200:
+            self.comments["comments"] = self.comments["comments"][-200:]
+        self._save_comments()
+
+    def get_latest_comment_any(self) -> Optional[str]:
+        if self._use_db:
+            return db.db_comments_get_latest_any()
+        comments = self.comments.get("comments") or []
+        if not comments:
+            return None
+        return comments[-1].get("text")
+
+    def get_latest_comment_for_chat(self, chat_id: str) -> Optional[str]:
+        if self._use_db:
+            return db.db_comments_get_latest_for_chat(chat_id)
+        comments = self.comments.get("comments") or []
+        for item in reversed(comments):
+            if str(item.get("chat_id")) == str(chat_id):
+                return item.get("text")
+        return None
+
 class GroupsManager:
-    """Управление списком групп, в которых бот является администратором."""
+    """Управление списком групп (файл или PostgreSQL при DATABASE_URL)."""
     
     def __init__(self, groups_file: str = "groups.json"):
         self.groups_file = Path(groups_file)
-        self.groups: List[Dict[str, Any]] = self._load_groups()
-        self._active_group_id: Optional[str] = None
+        self._use_db = bool(os.getenv("DATABASE_URL"))
+        self.groups, self._active_group_id = self._load_groups()
     
-    def _load_groups(self) -> List[Dict[str, Any]]:
-        self._active_group_id = None
+    def _load_groups(self) -> tuple:
+        """Возвращает (list of groups, active_group_id)."""
+        if self._use_db:
+            return db.db_groups_load()
         if self.groups_file.exists():
             try:
                 with open(self.groups_file, 'r', encoding='utf-8') as f:
                     data = json.load(f)
                     if isinstance(data, list):
-                        return data
-                    self._active_group_id = data.get("active_group_id") or None
-                    return data.get("groups", [])
+                        return data, None
+                    return data.get("groups", []), data.get("active_group_id")
             except Exception as e:
                 logger.error(f"Ошибка при загрузке групп: {e}")
-        return []
+        return [], None
     
     def _save_groups(self):
+        if self._use_db:
+            db.db_groups_save(self.groups, self._active_group_id)
+            return
         try:
             with open(self.groups_file, 'w', encoding='utf-8') as f:
                 json.dump({
@@ -254,10 +362,16 @@ class GroupsManager:
             logger.error(f"Ошибка при сохранении групп: {e}")
     
     def get_all(self) -> List[Dict[str, Any]]:
+        if self._use_db:
+            self.groups, self._active_group_id = db.db_groups_load()
         return list(self.groups)
     
     def add_group(self, group_id: str, title: str = "") -> bool:
         gid = str(group_id)
+        if self._use_db:
+            db.db_groups_add(gid, title or f"Группа {gid}")
+            self.groups, self._active_group_id = db.db_groups_load()
+            return True
         for g in self.groups:
             if str(g.get("group_id")) == gid:
                 g["title"] = title or g.get("title", "")
@@ -269,6 +383,10 @@ class GroupsManager:
     
     def set_active(self, group_id: str) -> bool:
         gid = str(group_id)
+        if self._use_db:
+            db.db_groups_set_active(gid)
+            self.groups, self._active_group_id = db.db_groups_load()
+            return True
         for g in self.groups:
             if str(g.get("group_id")) == gid:
                 self._active_group_id = gid
@@ -315,6 +433,19 @@ class Settings:
         self.zapier_mode = os.getenv("ZAPIER_MODE", "").strip().lower() in ("1", "true", "yes")
         if self.zapier_mode:
             logger.info("ZAPIER_MODE включён: публикация в Telegram через Zapier (бот и группа настраиваются в Zapier).")
+
+        # Локальный часовой пояс администратора (для ввода локального времени)
+        self.local_timezone_name = os.getenv("LOCAL_TIMEZONE")
+        self.local_timezone: Optional[Any] = None
+        if self.local_timezone_name:
+            if ZoneInfo is None:
+                logger.warning("LOCAL_TIMEZONE задан, но модуль zoneinfo недоступен. Будет игнорироваться.")
+            else:
+                try:
+                    self.local_timezone = ZoneInfo(self.local_timezone_name)
+                    logger.info(f"LOCAL_TIMEZONE установлен: {self.local_timezone_name}")
+                except Exception as e:
+                    logger.warning(f"Не удалось инициализировать LOCAL_TIMEZONE={self.local_timezone_name}: {e}")
         
         # Проверка критически важных настроек
         if not self.zapier_mode and not all([self.telegram_token, self.telegram_group_id]):
@@ -326,12 +457,32 @@ class Settings:
             return bool(self.telegram_token)  # для бота-администратора; публикация — через Zapier
         return bool(self.telegram_token) and bool(get_active_group_id())
 
+    def convert_local_time_to_server_hhmm(self, hour: int, minute: int) -> Optional[str]:
+        """
+        Перевод локального времени администратора (LOCAL_TIMEZONE) в серверное HH:MM (UTC),
+        которое затем используется в расписании.
+        """
+        if not self.local_timezone or ZoneInfo is None:
+            return None
+        try:
+            now_utc = datetime.now(timezone.utc)
+            local_now = now_utc.astimezone(self.local_timezone)
+            candidate_local = local_now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+            if candidate_local <= local_now:
+                candidate_local += timedelta(days=1)
+            candidate_utc = candidate_local.astimezone(timezone.utc)
+            return candidate_utc.strftime("%H:%M")
+        except Exception as e:
+            logger.warning(f"Ошибка конвертации локального времени в серверное: {e}")
+            return None
+
 # Инициализация настроек
 settings = Settings()
 
 # Инициализация менеджеров
 schedule_manager = ScheduleManager()
 stats_manager = StatsManager()
+comments_manager = CommentsManager()
 groups_manager = GroupsManager()
 # Если в .env задана одна группа, добавляем её в список при первом запуске
 if settings.telegram_group_id and not groups_manager.get_all():
@@ -370,6 +521,8 @@ _scheduler_task: Optional[asyncio.Task] = None
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global _scheduler_task
+    if os.getenv("DATABASE_URL"):
+        await asyncio.to_thread(db.init_db)
     _scheduler_task = asyncio.create_task(_scheduler_loop())
     yield
     if _scheduler_task:
@@ -431,7 +584,12 @@ class StatsResponse(BaseModel):
 
 # ====== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ======
 
-async def send_telegram_message(chat_id: str, message: str, parse_mode: str = "HTML") -> bool:
+async def send_telegram_message(
+    chat_id: str,
+    message: str,
+    parse_mode: str = "HTML",
+    reply_markup: Optional[Dict[str, Any]] = None,
+) -> bool:
     """
     Отправляет сообщение в указанный чат Telegram.
     
@@ -452,8 +610,10 @@ async def send_telegram_message(chat_id: str, message: str, parse_mode: str = "H
             "chat_id": chat_id,
             "text": message,
             "parse_mode": parse_mode,
-            "disable_web_page_preview": True
+            "disable_web_page_preview": True,
         }
+        if reply_markup is not None:
+            payload["reply_markup"] = json.dumps(reply_markup)
         
         response = await asyncio.to_thread(requests.post, url, data=payload)
         response_data = response.json()
@@ -490,36 +650,10 @@ async def send_status_message(message: str) -> bool:
 
 async def get_latest_message() -> Optional[str]:
     """
-    Получает последнее сообщение из Telegram группы.
-    
-    Returns:
-        Optional[str]: Текст последнего сообщения или None, если сообщений нет
+    Возвращает последний комментарий, полученный через Zapier (CommentsManager).
+    Прямые вызовы getUpdates не используются, чтобы не конфликтовать с webhook.
     """
-    try:
-        url = f"https://api.telegram.org/bot{settings.telegram_token}/getUpdates"
-        response = await asyncio.to_thread(requests.get, url)
-        response_data = response.json()
-        
-        if not response_data.get("ok"):
-            error_desc = response_data.get('description', 'Неизвестная ошибка')
-            await send_status_message(f"⚠️ Ошибка при получении обновлений из Telegram: {error_desc}")
-            return None
-            
-        if "result" not in response_data or not response_data["result"]:
-            return None
-        
-        # Берем последнее сообщение из группы
-        for update in reversed(response_data["result"]):
-            if "message" in update:
-                message = update["message"]
-                if str(message.get("chat", {}).get("id")) == str(get_active_group_id()):
-                    return message.get("text")
-        return None
-        
-    except Exception as e:
-        await send_status_message(f"⚠️ Критическая ошибка при получении последнего сообщения: {str(e)}")
-        logger.exception("Ошибка при получении последнего сообщения")
-        return None
+    return comments_manager.get_latest_comment_any()
 
 async def is_travel_related(comment: str) -> bool:
     """
@@ -830,7 +964,7 @@ async def _generate_post_content_for_zapier() -> Optional[Dict[str, Any]]:
         logger.warning("OPENAI_API_KEY не установлен, генерация для Zapier недоступна")
         return None
     try:
-        latest_comment = await get_latest_message()
+        latest_comment = comments_manager.get_latest_comment_any()
         if latest_comment and await is_travel_related(latest_comment):
             generated_post = await generate_post(latest_comment)
         else:
@@ -1034,21 +1168,28 @@ async def handle_bot_command(command: str, chat_id: str, message_text: str = "")
     
     if command == "/start" or command == "/help":
         zapier_note = "\n📌 <i>Публикация в Telegram идёт через Zapier (бот и группа подключаются в Zapier).</i>\n" if settings.zapier_mode else ""
-        return f"""🤖 <b>SMM-эксперт путешественника</b>{zapier_note}
+        tz_note = ""
+        if settings.local_timezone_name:
+            tz_note = f"\n🕒 Локальный часовой пояс: <code>{settings.local_timezone_name}</code> (команда /setlocal HH:MM задаёт время в нём)."
+        return f"""🤖 <b>SMM-эксперт путешественника</b>{zapier_note}{tz_note}
 
 <b>Доступные команды:</b>
+/generate_now - Сгенерировать пост без расписания (только для администратора)
 /schedule - Показать текущее расписание публикаций
-/settime HH:MM - Установить время следующей публикации (например: /settime 14:30)
+/settime HH:MM - Установить время следующей публикации (серверное время, например: /settime 14:30)
+/setlocal HH:MM - Установить время следующей публикации по локальному времени (если задан LOCAL_TIMEZONE)
 /setfreq N - Установить частоту публикаций в часах (например: /setfreq 24)
 /stats - Показать статистику вовлеченности за последние 7 дней
 /stats N - Показать статистику за последние N дней
 /groups - Список групп для публикаций
 /setgroup ID - Выбрать активную группу для публикаций
 /addgroup - Добавить группу (отправьте в чате группы, где бот админ)
+/toggle_schedule - Включить/выключить генерацию по расписанию
 /nextpost - Показать информацию о следующем запланированном посте
 
 Примеры:
-/settime 09:00 - установить публикацию на 9 утра
+/settime 09:00 - установить публикацию на 9 утра (по времени сервера)
+/setlocal 10:00 - установить публикацию на 10:00 по локальному времени
 /setfreq 12 - публиковать каждые 12 часов"""
     
     elif command == "/schedule":
@@ -1062,6 +1203,21 @@ async def handle_bot_command(command: str, chat_id: str, message_text: str = "")
         response += f"⏰ <b>Частота:</b> каждые {frequency} часов\n"
         response += f"🔄 <b>Статус:</b> {'Включено' if enabled else 'Выключено'}\n\n"
         response += "Используйте /settime для установки времени или /setfreq для изменения частоты."
+        return response
+    
+    elif command == "/generate_now":
+        post_data = await _generate_post_content_for_zapier()
+        if not post_data:
+            return "❌ Не удалось сгенерировать пост. Проверьте OPENAI_API_KEY и логи сервера."
+        caption = post_data.get("photo_caption") or ""
+        body = post_data.get("body_text") or ""
+        image_url = post_data.get("photo_url") or ""
+        response = "✅ <b>Пост сгенерирован без расписания</b>\n\n"
+        if image_url:
+            response += f"🖼️ <b>Изображение:</b> {image_url}\n\n"
+        response += f"<b>Заголовок:</b>\n{caption}\n\n"
+        if body:
+            response += f"<b>Текст:</b>\n{body}"
         return response
     
     elif command.startswith("/settime"):
@@ -1086,6 +1242,28 @@ async def handle_bot_command(command: str, chat_id: str, message_text: str = "")
             
         except ValueError:
             return "❌ Неверный формат времени. Используйте: /settime HH:MM\nПример: /settime 14:30"
+
+    elif command.startswith("/setlocal"):
+        # Устанавливаем время следующей публикации по локальному часовому поясу (LOCAL_TIMEZONE)
+        parts = message_text.split()
+        if len(parts) < 2:
+            return "❌ Неверный формат. Используйте: /setlocal HH:MM\nПример: /setlocal 10:00"
+        if not settings.local_timezone:
+            return "❌ Локальный часовой пояс не настроен. Установите переменную окружения LOCAL_TIMEZONE (например, Europe/Moscow)."
+        time_str = parts[1]
+        try:
+            hour, minute = map(int, time_str.split(":"))
+            if not (0 <= hour <= 23 and 0 <= minute <= 59):
+                return "❌ Неверное время. Используйте формат HH:MM (например: 10:00)"
+            server_time = settings.convert_local_time_to_server_hhmm(hour, minute)
+            if not server_time:
+                return "❌ Не удалось перевести локальное время в серверное. Проверьте LOCAL_TIMEZONE."
+            schedule_manager.set_next_post_time(server_time)
+            response = f"✅ Время следующей публикации установлено по локальному времени: <b>{time_str}</b>\n"
+            response += f"🕒 Это соответствует серверному времени (UTC) примерно: <b>{server_time}</b>"
+            return response
+        except ValueError:
+            return "❌ Неверный формат времени. Используйте: /setlocal HH:MM\nПример: /setlocal 10:00"
     
     elif command.startswith("/setfreq"):
         # Парсим частоту из команды /setfreq N
@@ -1134,6 +1312,13 @@ async def handle_bot_command(command: str, chat_id: str, message_text: str = "")
                 response += f"• {post_time}: 👁️ {post.get('views', 0)} 💬 {post.get('comments', 0)}\n"
         
         return response
+    
+    elif command == "/toggle_schedule":
+        current = schedule_manager.is_enabled()
+        schedule_manager.set_enabled(not current)
+        new_status = "Включено" if not current else "Выключено"
+        emoji = "✅" if not current else "⏸️"
+        return f"{emoji} Расписание теперь: <b>{new_status}</b>"
     
     elif command == "/groups":
         try:
@@ -1208,9 +1393,9 @@ async def generate_and_publish_post(background: bool = False) -> Dict[str, Any]:
         }
     
     try:
-        # Получаем последний комментарий
-        await send_status_message("🔍 Ищем последний комментарий в группе...")
-        latest_comment = await get_latest_message()
+        # Получаем последний комментарий (через Zapier CommentsManager)
+        await send_status_message("🔍 Ищем последний комментарий из группы (через Zapier)...")
+        latest_comment = comments_manager.get_latest_comment_any()
         
         # Генерируем пост
         if latest_comment and await is_travel_related(latest_comment):
@@ -1325,7 +1510,8 @@ async def health_check():
         "openai_api_configured": bool(settings.openai_api_key),
         "zapier_mode": settings.zapier_mode,
         "telegram_configured": bool(settings.telegram_token and (get_active_group_id() or settings.zapier_mode)),
-        "admin_notifications": bool(settings.admin_chat_id)
+        "admin_notifications": bool(settings.admin_chat_id),
+        "database_configured": bool(os.getenv("DATABASE_URL")),
     }
     
     if is_healthy:
@@ -1406,8 +1592,22 @@ async def telegram_webhook(request: Request):
         # Обрабатываем команду
         response_text = await handle_bot_command(command, chat_id, text)
         
-        # Отправляем ответ
-        await send_telegram_message(chat_id, response_text)
+        # Клавиатура администратора с кнопками-командами
+        admin_keyboard = {
+            "keyboard": [
+                [{"text": "/generate_now"}],
+                [{"text": "/toggle_schedule"}],
+                [{"text": "/schedule"}],
+            ],
+            "resize_keyboard": True,
+            "one_time_keyboard": False,
+        }
+        
+        # Отправляем ответ (для /start и /help добавляем клавиатуру)
+        if command in ("/start", "/help"):
+            await send_telegram_message(chat_id, response_text, reply_markup=admin_keyboard)
+        else:
+            await send_telegram_message(chat_id, response_text)
         
         return JSONResponse(content={"ok": True})
         
@@ -1455,6 +1655,30 @@ async def zapier_schedule():
         "enabled": schedule_manager.is_enabled(),
         "next_run_at": schedule_manager.schedule.get("next_run_at"),
     })
+
+
+class ZapierComment(BaseModel):
+    chat_id: str
+    message_id: Optional[str] = None
+    text: str
+    username: Optional[str] = None
+    timestamp: Optional[str] = None
+
+
+@app.post("/zapier/comment")
+async def zapier_comment(comment: ZapierComment):
+    """
+    Приём комментариев из Telegram через Zapier.
+    Второй Zap: триггер Telegram (новое сообщение в группе) → Webhook POST сюда.
+    """
+    comments_manager.add_comment(
+        chat_id=comment.chat_id,
+        message_id=comment.message_id,
+        text=comment.text,
+        timestamp=comment.timestamp,
+    )
+    logger.info(f"Получен комментарий из Zapier для чата {comment.chat_id}: {comment.text[:80]}...")
+    return JSONResponse(content={"status": "ok"})
 
 @app.post("/zapier/generate-post")
 async def zapier_generate_post():
