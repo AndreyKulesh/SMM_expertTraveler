@@ -822,7 +822,10 @@ async def generate_post(extra_context: Optional[str] = None) -> str:
     
     full_prompt = BASE_PROMPT
     if extra_context:
-        full_prompt += f"\n\nДополнительно учти комментарий участника группы:\n{extra_context}\nОрганично интегрируй его смысл в пост."
+        # Длинный комментарий обрезаем, чтобы не перегружать промпт
+        max_comment_len = 500
+        context = extra_context[:max_comment_len] + ("..." if len(extra_context) > max_comment_len else "")
+        full_prompt += f"\n\nДополнительно учти комментарий участника группы:\n{context}\nОрганично интегрируй его смысл в пост."
     
     # Fallback-пост на случай ошибки
     fallback_content = """
@@ -1609,19 +1612,30 @@ async def telegram_webhook(request: Request):
         
         message = data["message"]
         chat_id = str(message.get("chat", {}).get("id"))
-        text = message.get("text", "")
+        text = message.get("text", "").strip() if message.get("text") else ""
+        chat = message.get("chat", {})
+        chat_type = chat.get("type", "")
+        from_user = message.get("from") or {}
+        from_id = str(from_user.get("id", ""))
+        is_bot = from_user.get("is_bot", False)
+        is_admin = settings.admin_chat_id and from_id == str(settings.admin_chat_id)
         
-        # Обрабатываем только команды
+        # Сообщения из группы (не команды) — сохраняем как комментарии для следующего поста
+        if text and not text.startswith("/") and chat_type in ("group", "supergroup") and not is_bot:
+            active_gid = get_active_group_id()
+            all_groups = [str(g.get("group_id")) for g in groups_manager.get_all()]
+            if chat_id == str(active_gid) or chat_id in all_groups:
+                message_id = str(message.get("message_id", ""))
+                comments_manager.add_comment(chat_id, message_id, text)
+                logger.info(f"Комментарий из группы {chat_id} сохранён: {text[:80]}...")
+            return JSONResponse(content={"ok": True})
+        
+        # Дальше только команды
         if not text.startswith("/"):
             return JSONResponse(content={"ok": True})
         
-        # Извлекаем команду
         parts = text.split(maxsplit=1)
         command = parts[0]
-        chat = message.get("chat", {})
-        chat_type = chat.get("type", "")
-        from_id = str(message.get("from", {}).get("id", ""))
-        is_admin = settings.admin_chat_id and from_id == str(settings.admin_chat_id)
         
         # Добавление группы: /addgroup отправлено в чате группы администратором
         if command == "/addgroup" and chat_type in ("group", "supergroup") and is_admin:
