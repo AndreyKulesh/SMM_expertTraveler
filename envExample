@@ -1,0 +1,23 @@
+# Скопируйте в .env и заполните значения.
+
+# OpenAI
+OPENAI_API_KEY=
+
+# Telegram (бот для команд администратора и уведомлений)
+TELEGRAM_TOKEN=
+ADMIN_CHAT_ID=
+
+# Группа для публикаций (опционально в режиме Zapier; при публикации через Zapier группу выбирают в Zapier)
+TELEGRAM_GROUP_ID=
+
+# Режим Zapier: публикация в Telegram через Zapier (true/1/yes)
+ZAPIER_MODE=true
+
+# Локальный часовой пояс для /setlocal (например Europe/Moscow)
+LOCAL_TIMEZONE=Europe/Moscow
+
+# PostgreSQL (Render: создайте бесплатный инстанс и подключите к сервису; расписание, статистика и комментарии сохраняются в БД и не сбрасываются при перезапуске)
+DATABASE_URL=
+
+# Порт (по умолчанию 8000)
+PORT=8000
